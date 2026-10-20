@@ -25,7 +25,7 @@ npm install && npm run build   # 构建到 lib/
 npm install /path/to/dsh-tool-slack
 ```
 
-需要 `@deepseek-ai/cordis`（^4.0.1）和 `@deepseek-ai/dsh-tools`（^0.1.0-rc.6）作为 peer 依赖，由 dsh 运行时提供。
+需要 `@deepseek-ai/cordis`（^4.0.1）和 `@deepseek-ai/dsh-tools`（^0.1.0-rc.6 || ^0.2.0-rc.1）作为 peer 依赖，由 dsh 运行时提供。
 
 ## 配置
 
