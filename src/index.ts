@@ -15,6 +15,8 @@ export interface SlackPluginConfig {
   baseUrl?: string
   /** Request timeout in milliseconds. */
   timeoutMs?: number
+  /** Largest file slack_upload_file will upload, in bytes (default 100 MiB). */
+  maxUploadBytes?: number
 }
 
 export function apply(ctx: Context, config: SlackPluginConfig = {}) {
@@ -23,6 +25,7 @@ export function apply(ctx: Context, config: SlackPluginConfig = {}) {
     defaultChannel: config.defaultChannel,
     baseUrl: config.baseUrl,
     timeoutMs: config.timeoutMs,
+    maxUploadBytes: config.maxUploadBytes,
   })
   for (const tool of createTools(client)) {
     ctx.tools.register(tool)
@@ -1273,6 +1276,77 @@ export function createTools(client: SlackClient) {
         } catch (error) {
           if (error instanceof SlackError && isWriteFailure(error)) {
             return { ok: false, channel, ts: args.timestamp as string, reason: `Slack rejected the reaction: ${error.code}` }
+          }
+          throw error
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'slack_upload_file',
+      description: 'Upload a local file to a Slack channel, DM or thread using the external upload flow (files.getUploadURLExternal, then upload, then files.completeUploadExternal). WRITE operation: requires files:write and channel write access; channel names additionally need channels:read. The file is attributed to the identity of the configured token, so with a user token it is posted as that user.',
+      parameters: {
+        path: { type: 'string', required: true, description: 'Local path of the file to upload (~ is expanded)' },
+        channel: { type: 'string', description: 'Channel id or name; DM ids such as D0123456789 work. Defaults to plugin config when omitted' },
+        title: { type: 'string', description: 'Title shown for the file (defaults to the filename)' },
+        initialComment: { type: 'string', description: 'Message text posted together with the file' },
+        threadTs: { type: 'string', description: 'Parent message ts to upload into an existing thread' },
+        filename: { type: 'string', description: 'Filename to use in Slack instead of the local basename' },
+        asUser: { type: 'boolean', description: 'Accepted for parity with slack_post_message; uploads are always attributed to the token owner, so a user token posts as the user' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean', description: 'Whether the file was uploaded and shared' },
+            fileId: { type: 'string', description: 'Slack file id' },
+            title: { oneOf: [{ type: 'string' }, { type: 'null' }], description: 'File title' },
+            permalink: { oneOf: [{ type: 'string' }, { type: 'null' }], description: 'File permalink; null when Slack did not return one (needs files:read)' },
+            channel: { type: 'string', description: 'Channel id the file was shared to' },
+            ts: { oneOf: [{ type: 'string' }, { type: 'null' }], description: 'Timestamp of the share message when Slack reports it (needs files:read)' },
+            threadTs: { oneOf: [{ type: 'string' }, { type: 'null' }], description: 'Thread timestamp when uploaded into a thread' },
+            size: { type: 'integer', description: 'Bytes uploaded' },
+            reason: { type: 'string', description: 'Explanation when not uploaded' },
+          },
+        },
+        render: (_args, value) => {
+          if (!value.ok) return [{ type: 'text', text: `Could not upload Slack file: ${value.reason}` }]
+          return [{ type: 'text', text: `Uploaded ${value.fileId} (${value.size} bytes) to ${value.channel}${value.permalink ? `\n${value.permalink}` : ''}${value.ts ? `\nmessage ts ${value.ts}` : ''}` }]
+        },
+      },
+      presentCall(args): ToolCallView {
+        return { card: 'generic', title: `Upload ${String(args.filename ?? args.path)} to ${resolveChannelLabel(client, args)}`, kind: 'edit' }
+      },
+      presentResult(_args, result): ToolResultView | undefined {
+        const v = result as unknown as { ok?: boolean; fileId?: string; permalink?: string | null }
+        if (!v.ok) return { card: 'generic', title: 'Upload failed' }
+        return { card: 'generic', title: `Uploaded ${v.fileId ?? ''}`, content: [{ type: 'text', text: v.permalink ?? '' }] }
+      },
+      async execute(args, exec) {
+        const fail = (channel: string, reason: string) => ({ ok: false, fileId: '', title: null, permalink: null, channel, ts: null, threadTs: null, size: 0, reason })
+        if (!client.hasToken()) return fail('', 'Uploading a Slack file requires a token.')
+        const channel = resolveChannel(client, args)
+        if (!channel) return fail('', 'Slack channel is required. Set plugin config or pass channel.')
+        try {
+          return await client.uploadFile({
+            path: args.path as string,
+            channel,
+            title: args.title,
+            initialComment: args.initialComment,
+            threadTs: args.threadTs,
+            filename: args.filename,
+            signal: exec.signal,
+          })
+        } catch (error) {
+          if (error instanceof SlackError && error.code === 'missing_scope') {
+            return fail(channel, 'Slack rejected the upload: missing_scope. The token needs files:write (and channels:read/groups:read to resolve channel names); reinstall the Slack app after adding scopes.')
+          }
+          if (error instanceof SlackError && (error.code === 'file_not_found' || error.code === 'not_a_file' || error.code === 'file_too_large' || error.code === 'file_empty')) {
+            return fail(channel, error.message)
+          }
+          if (error instanceof SlackError && (isWriteFailure(error) || error.code === 'upload_failed' || error.code === 'bad_upload_url' || error.code === 'no_upload_url')) {
+            return fail(channel, `Slack rejected the upload: ${error.code ?? error.message}`)
           }
           throw error
         }

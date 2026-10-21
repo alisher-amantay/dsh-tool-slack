@@ -1,5 +1,8 @@
 /** Slack Web API client with injected fetch for testability. */
 
+import { readFile, stat } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, resolve } from 'node:path'
 import { assertSafeUrl, EndpointSecurityError, normalizeBaseUrl, type LookupImpl } from './url-security.js'
 
 export interface SlackClientOptions {
@@ -13,6 +16,8 @@ export interface SlackClientOptions {
   timeoutMs?: number
   /** Test-only DNS lookup override; production uses node:dns/promises. */
   lookupImpl?: LookupImpl
+  /** Largest file slack_upload_file will read into memory, in bytes (default 100 MiB). */
+  maxUploadBytes?: number
 }
 
 export interface AuthInfo {
@@ -186,6 +191,20 @@ export interface ReactionResult {
   ts: string
   reason?: string
 }
+
+export interface FileUploadResult {
+  ok: boolean
+  fileId: string
+  title: string | null
+  permalink: string | null
+  channel: string
+  ts: string | null
+  threadTs: string | null
+  size: number
+  reason?: string
+}
+
+export const DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 export type SlackBlock = Record<string, unknown>
 export type SlackAttachment = Record<string, unknown>
@@ -416,6 +435,27 @@ interface RawDeleteScheduledMessage {
   channel?: string
   scheduled_message_id?: string
   error?: string
+}
+
+interface RawUploadUrl {
+  ok: boolean
+  upload_url?: string
+  file_id?: string
+}
+
+interface RawCompleteUpload {
+  ok: boolean
+  files?: Array<{ id?: string; title?: string; permalink?: string }>
+}
+
+interface RawFileInfo {
+  ok: boolean
+  file?: {
+    id?: string
+    title?: string
+    permalink?: string
+    shares?: Record<string, Record<string, Array<{ ts?: string; thread_ts?: string }>>>
+  }
 }
 
 interface RawReaction {
@@ -957,6 +997,143 @@ export class SlackClient {
       signal: input.signal,
     })
     return { ok: true, channel: input.channel, ts: input.timestamp }
+  }
+
+  /**
+   * Upload a local file with Slack's external upload flow:
+   * files.getUploadURLExternal -> POST bytes to upload_url -> files.completeUploadExternal.
+   * (files.upload is deprecated and not used.)
+   */
+  async uploadFile(input: {
+    path: string
+    channel: string
+    title?: string
+    initialComment?: string
+    threadTs?: string
+    filename?: string
+    signal?: AbortSignal
+  }): Promise<FileUploadResult> {
+    const filePath = resolve(input.path.startsWith('~') ? input.path.replace(/^~(?=$|\/)/, homedir()) : input.path)
+    let info
+    try {
+      info = await stat(filePath)
+    } catch {
+      throw new SlackError(`File not found or unreadable: ${filePath}`, 400, 'file_not_found')
+    }
+    if (!info.isFile()) throw new SlackError(`Not a regular file: ${filePath}`, 400, 'not_a_file')
+    const max = this.options.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES
+    if (info.size > max) {
+      throw new SlackError(`File is too large: ${info.size} bytes exceeds the ${max} byte upload limit`, 400, 'file_too_large')
+    }
+    if (info.size === 0) throw new SlackError('File is empty; Slack cannot upload a zero-byte file', 400, 'file_empty')
+    const bytes = await readFile(filePath)
+    const filename = input.filename ?? basename(filePath)
+    const channelId = await this.resolveChannelId(input.channel, input.signal)
+
+    // 1. Reserve an upload URL.
+    const urlParams = new URLSearchParams({ filename, length: String(bytes.byteLength) })
+    const reserved = await this.request<RawUploadUrl>('files.getUploadURLExternal', {
+      params: urlParams,
+      init: { method: 'POST' },
+      signal: input.signal,
+    })
+    if (!reserved.upload_url || !reserved.file_id) {
+      throw new SlackError('Slack did not return an upload_url/file_id', 502, 'no_upload_url')
+    }
+
+    // 2. Send the bytes. No Authorization header: the URL is pre-signed and must not receive the token.
+    await this.postBytes(reserved.upload_url, bytes, input.signal)
+
+    // 3. Finish and share to the channel.
+    const form = new URLSearchParams({
+      files: JSON.stringify([{ id: reserved.file_id, title: input.title ?? filename }]),
+      channel_id: channelId,
+    })
+    if (input.initialComment !== undefined) form.set('initial_comment', input.initialComment)
+    if (input.threadTs !== undefined) form.set('thread_ts', input.threadTs)
+    const done = await this.request<RawCompleteUpload>('files.completeUploadExternal', {
+      init: {
+        method: 'POST',
+        body: form.toString(),
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      },
+      signal: input.signal,
+    })
+    const file = done.files?.[0]
+    const fileId = file?.id ?? reserved.file_id
+    let permalink = file?.permalink ?? null
+    let ts: string | null = null
+    // Best effort: files.info needs files:read; without it we still report success, just without these fields.
+    try {
+      const details = await this.request<RawFileInfo>('files.info', {
+        params: new URLSearchParams({ file: fileId }),
+        signal: input.signal,
+      })
+      permalink = details.file?.permalink ?? permalink
+      const shared = Object.values(details.file?.shares ?? {}).map(group => group[channelId]?.[0]).find(Boolean)
+      ts = shared?.ts ?? null
+    } catch (error) {
+      if (!(error instanceof SlackError)) throw error
+    }
+    return {
+      ok: true,
+      fileId,
+      title: file?.title ?? input.title ?? filename,
+      permalink,
+      channel: channelId,
+      ts,
+      threadTs: input.threadTs ?? null,
+      size: bytes.byteLength,
+    }
+  }
+
+  private async resolveChannelId(channel: string, signal?: AbortSignal): Promise<string> {
+    const name = channel.replace(/^#/, '')
+    if (/^[CGD][A-Z0-9]{6,}$/.test(name)) return name
+    let cursor: string | undefined
+    for (let page = 0; page < 10; page++) {
+      const result = await this.listChannels({ types: 'public_channel,private_channel', excludeArchived: true, limit: 200, cursor, signal })
+      const match = result.items.find(item => item.name === name || item.nameNormalized === name)
+      if (match) return match.id
+      if (!result.nextCursor) break
+      cursor = result.nextCursor
+    }
+    throw new SlackError(`Channel not found: ${channel}`, 404, 'channel_not_found')
+  }
+
+  private async postBytes(uploadUrl: string, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
+    let target: URL
+    try {
+      target = new URL(uploadUrl)
+      if (target.protocol !== 'https:') throw new SlackError('Slack upload URL must be https', 502, 'bad_upload_url')
+      await assertSafeUrl(target, this.lookupImpl)
+    } catch (error) {
+      if (error instanceof EndpointSecurityError) throw new SlackError(error.message, 400)
+      if (error instanceof TypeError) throw new SlackError('Slack returned an invalid upload URL', 502, 'bad_upload_url')
+      throw error
+    }
+    const controller = new AbortController()
+    const onAbort = () => controller.abort(signal?.reason)
+    if (signal) {
+      if (signal.aborted) controller.abort(signal.reason)
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
+    const budget = Math.max(this.timeoutMs, 120000)
+    const timer = setTimeout(() => controller.abort(new Error(`Slack file upload timed out after ${budget}ms`)), budget)
+    try {
+      const response = await this.fetchImpl(target.toString(), {
+        method: 'POST',
+        body: bytes as unknown as BodyInit,
+        headers: { 'content-type': 'application/octet-stream' },
+        signal: controller.signal,
+      })
+      if (!response.ok) {
+        throw new SlackError(`Slack upload URL rejected the bytes with status ${response.status}`, response.status, 'upload_failed')
+      }
+    } finally {
+      clearTimeout(timer)
+      if (signal) signal.removeEventListener('abort', onAbort)
+    }
   }
 
   private addOptional(target: Record<string, unknown>, key: string, value: unknown): void {

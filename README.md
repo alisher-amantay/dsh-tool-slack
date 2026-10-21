@@ -4,7 +4,7 @@
 
 A Cordis tool plugin that gives [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) focused Slack workflows: workspace auth checks, channel discovery, channel members, message history, thread replies, message search, user profiles, user groups, file metadata, rich messages, scheduled messages, and common notification actions.
 
-The plugin registers 19 tools with the official `ctx.tools.register(defineTool(...))` contract, uses `presentCall`/`presentResult` for compact replay-friendly UI cards, and treats authentication, request timeout, and cancellation as first-class concerns.
+The plugin registers 20 tools with the official `ctx.tools.register(defineTool(...))` contract, uses `presentCall`/`presentResult` for compact replay-friendly UI cards, and treats authentication, request timeout, and cancellation as first-class concerns.
 
 ## Install
 
@@ -38,6 +38,7 @@ Load the plugin in a dsh composition config (`cordis.yml`):
     defaultChannel: 'general'  # optional default channel; tools can still override it
     baseUrl: 'https://slack.com/api'   # optional Slack Web API base URL
     timeoutMs: 15000           # optional request timeout in ms (default 15000)
+    maxUploadBytes: 104857600  # optional slack_upload_file size cap in bytes (default 100 MiB)
 ```
 
 Full example: [examples/cordis.yml](examples/cordis.yml).
@@ -74,6 +75,7 @@ The `baseUrl` override must be an absolute `http://` or `https://` root URL. Onl
 | `slack_delete_scheduled_message` | Delete a message that has not been sent yet | config or arg |
 | `slack_delete_message` | Delete an existing message | config or arg |
 | `slack_add_reaction` | Add a reaction emoji to a message | config or arg |
+| `slack_upload_file` | Upload a local file (external upload flow: `files.getUploadURLExternal` → upload → `files.completeUploadExternal`), with optional title, comment, thread and filename. Needs `files:write`; permalink and message `ts` come from `files.info` and are `null` without `files:read` | config or arg |
 
 ## Behavior contract
 

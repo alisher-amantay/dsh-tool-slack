@@ -41,6 +41,7 @@ describe('tool definitions', () => {
       'slack_schedule_message',
       'slack_search_messages',
       'slack_update_message',
+      'slack_upload_file',
     ])
   })
 

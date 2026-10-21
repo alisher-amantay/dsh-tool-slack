@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
@@ -31,6 +34,8 @@ const file = {
   id: 'F1', name: 'a.png', title: 'a', user: 'U1', created: 1700000000, timestamp: 1700000000, updated: 1700000001,
   mimetype: 'image/png', filetype: 'png', size: 10, permalink: 'https://p', url_private: 'https://u', is_public: false, channels: ['C1'],
 }
+const uploadPath = join(mkdtempSync(join(tmpdir(), 'slack-up-')), 'note.txt')
+writeFileSync(uploadPath, 'hello')
 const meta = { response_metadata: { next_cursor: 'abc=' } }
 
 const responses: Record<string, unknown> = {
@@ -53,6 +58,9 @@ const responses: Record<string, unknown> = {
   'chat.deleteScheduledMessage': { ok: true },
   'chat.delete': { ok: true, channel: 'C1', ts: '1.1' },
   'reactions.add': { ok: true },
+  'files.getUploadURLExternal': { ok: true, upload_url: 'https://files.slack.com/upload/v1/abc', file_id: 'F9' },
+  'files.completeUploadExternal': { ok: true, files: [{ id: 'F9', title: 'note.txt' }] },
+  'files.info': { ok: true, file: { id: 'F9', title: 'note.txt', permalink: 'https://nace.slack.com/files/U1/F9/note.txt', shares: { private: { D0123456789: [{ ts: '1792400000.000100' }] } } } },
 }
 
 /** Minimal valid args per tool; anything not listed needs none. */
@@ -71,6 +79,7 @@ const args: Record<string, Record<string, unknown>> = {
   slack_schedule_message: { channel: 'C1', postAt: '1792400000', text: 'x' },
   slack_delete_scheduled_message: { channel: 'C1', scheduledMessageId: 'Q1' },
   slack_delete_message: { channel: 'C1', ts: '1.1' },
+  slack_upload_file: { path: uploadPath, channel: 'D0123456789' },
   slack_add_reaction: { channel: 'C1', timestamp: '1.1', name: 'eyes' },
 }
 
@@ -78,6 +87,7 @@ describe('output schemas accept real-shaped Slack responses', () => {
   const calls: string[] = []
   const fetchImpl = async (input: RequestInfo | URL) => {
     const method = new URL(String(input)).pathname.split('/').pop() as string
+    if (String(input).startsWith('https://files.slack.com/upload')) return new Response('OK - 5', { status: 200 })
     calls.push(method)
     const body = responses[method]
     if (!body) throw new Error(`unmocked Slack method ${method}`)
@@ -87,7 +97,7 @@ describe('output schemas accept real-shaped Slack responses', () => {
   const all = createTools(client)
 
   it('covers every registered tool', () => {
-    expect(all.length).toBe(19)
+    expect(all.length).toBe(20)
   })
 
   for (const tool of all) {
